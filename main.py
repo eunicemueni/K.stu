@@ -9,6 +9,7 @@ from pathlib import Path
 from fastapi import FastAPI, Body, Path, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+import httpx
 
 # Optional Firebase imports
 try:
@@ -75,6 +76,16 @@ class GenerateRequest(BaseModel):
 ORDERS = {}
 
 # -----------------------
+# Plan Rules
+# -----------------------
+PLAN_RULES = {
+    "entry": {"max_duration": 6, "max_per_day": 1, "watermark": True},
+    "pro": {"max_duration": 60, "max_per_day": None, "watermark": False},
+    "diamond": {"max_duration": 180, "max_per_day": None, "watermark": False},
+    "lifetime": {"max_duration": 180, "max_per_day": None, "watermark": False},
+}
+
+# -----------------------
 # Helper: Upload to Firebase
 # -----------------------
 def upload_to_firebase(file_path: str, dest_name: str):
@@ -86,45 +97,94 @@ def upload_to_firebase(file_path: str, dest_name: str):
     return blob.public_url
 
 # -----------------------
-# Helper: Simulate/Call RunDiffusion API
+# Helper: Real Video Generation with Watermark
 # -----------------------
-async def generate_video_api(prompt: str, duration: int, order_id: str):
-    """Replace this with real RunDiffusion/HuggingFace API call"""
-    # Simulate processing
-    await asyncio.sleep(3)
-    # Create dummy video file
-    tmp_file = Path(tempfile.gettempdir()) / f"{order_id}.mp4"
-    tmp_file.write_bytes(b"dummy video content")
-    # Upload to Firebase
-    public_url = upload_to_firebase(str(tmp_file), f"videos/{order_id}.mp4")
-    return public_url
+async def generate_video_api(prompt: str, duration: int, order_id: str, watermark: bool = False):
+    rundiffusion_key = os.getenv("RUNDIFFUSION_API_KEY")
+    hf_token = os.getenv("HUGGINGFACE_TOKEN", None)
+    eleven_key = os.getenv("ELEVENLABS_KEY", None)
+
+    async with httpx.AsyncClient(timeout=300) as client:
+        # Step 1: RunDiffusion API call
+        headers = {"Authorization": f"Bearer {rundiffusion_key}"}
+        payload = {"prompt": prompt, "duration": duration}
+        resp = await client.post("https://api.rundiffusion.com/v1/video", json=payload, headers=headers)
+        if resp.status_code != 200:
+            raise Exception(f"RunDiffusion API failed: {resp.text}")
+        video_bytes = resp.content
+        tmp_file = Path(tempfile.gettempdir()) / f"{order_id}.mp4"
+        tmp_file.write_bytes(video_bytes)
+
+        # Step 2: ElevenLabs voiceover (optional)
+        if eleven_key:
+            voice_payload = {"text": prompt, "voice": "alloy"}
+            headers_eleven = {"xi-api-key": eleven_key}
+            resp_voice = await client.post("https://api.elevenlabs.io/v1/text-to-speech", json=voice_payload, headers=headers_eleven)
+            if resp_voice.status_code == 200:
+                audio_bytes = resp_voice.content
+                audio_file = tmp_file.with_suffix(".mp3")
+                audio_file.write_bytes(audio_bytes)
+                merged_file = tmp_file.with_name(f"{order_id}_final.mp4")
+                os.system(f"ffmpeg -y -i {tmp_file} -i {audio_file} -c:v copy -c:a aac {merged_file}")
+                tmp_file = merged_file
+
+        # Step 3: Apply watermark if needed
+        if watermark:
+            watermarked_file = tmp_file.with_name(f"{order_id}_wm.mp4")
+            watermark_text = "Kairah Studio"
+            os.system(f"ffmpeg -y -i {tmp_file} -vf drawtext=\"fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf:text='{watermark_text}':fontsize=24:fontcolor=white@0.8:x=w-tw-10:y=h-th-10\" -c:a copy {watermarked_file}")
+            tmp_file = watermarked_file
+
+        # Step 4: Upload to Firebase
+        public_url = upload_to_firebase(str(tmp_file), f"videos/{order_id}.mp4")
+        return public_url
 
 # -----------------------
-# Endpoints
+# Endpoint: Generate Video
 # -----------------------
 @app.post("/generate")
 async def generate_video(req: GenerateRequest = Body(...)):
-    max_seconds = int(os.getenv("MAX_VIDEO_SECONDS", 180))
-    if req.duration > max_seconds:
-        raise HTTPException(status_code=400, detail=f"Video duration exceeds max {max_seconds}s")
+    plan = req.plan.lower()
+    if plan not in PLAN_RULES:
+        raise HTTPException(status_code=400, detail="Invalid plan")
+
+    rules = PLAN_RULES[plan]
+
+    # Check duration limit
+    if req.duration > rules["max_duration"]:
+        raise HTTPException(status_code=400, detail=f"{plan.capitalize()} plan allows max {rules['max_duration']}s video")
+
+    # Check daily limit (for Entry)
+    if rules["max_per_day"]:
+        user_orders_today = [
+            o for o in ORDERS.values()
+            if o["userId"] == req.userId and o["createdAt"][:10] == datetime.datetime.utcnow().isoformat()[:10]
+        ]
+        if len(user_orders_today) >= rules["max_per_day"]:
+            raise HTTPException(status_code=403, detail=f"{plan.capitalize()} plan allows only {rules['max_per_day']} video(s) per day")
 
     order_id = str(uuid.uuid4())
     order_data = {
         "userId": req.userId,
         "email": req.email,
-        "plan": req.plan,
+        "plan": plan,
         "prompt": req.prompt,
         "duration": req.duration,
         "status": "pending",
+        "watermark": rules["watermark"],
         "createdAt": datetime.datetime.utcnow().isoformat(),
         "resultUrl": None
     }
     ORDERS[order_id] = order_data
 
-    # Start async generation
     async def process_order(order_id, order_data):
         try:
-            video_url = await generate_video_api(order_data["prompt"], order_data["duration"], order_id)
+            video_url = await generate_video_api(
+                order_data["prompt"],
+                order_data["duration"],
+                order_id,
+                watermark=order_data["watermark"]
+            )
             order_data["status"] = "completed"
             order_data["resultUrl"] = video_url
             order_data["completedAt"] = datetime.datetime.utcnow().isoformat()
@@ -133,9 +193,11 @@ async def generate_video(req: GenerateRequest = Body(...)):
             order_data["error"] = str(e)
 
     asyncio.create_task(process_order(order_id, order_data))
+    return {"orderId": order_id, "status": "pending", "watermark": rules["watermark"]}
 
-    return {"orderId": order_id, "status": "pending"}
-
+# -----------------------
+# Endpoint: Order Status
+# -----------------------
 @app.get("/status/{orderId}")
 async def get_status(orderId: str = Path(...)):
     order = ORDERS.get(orderId)
@@ -143,6 +205,9 @@ async def get_status(orderId: str = Path(...)):
         raise HTTPException(status_code=404, detail="Order not found")
     return {"status": order["status"], "resultUrl": order.get("resultUrl")}
 
+# -----------------------
+# Endpoint: Admin Complete (Fake for Testing)
+# -----------------------
 @app.post("/admin/mark-completed/{orderId}")
 async def mark_completed(orderId: str = Path(...), x_admin_secret: str = Header(None)):
     secret = os.getenv("ADMIN_SECRET")
@@ -157,15 +222,12 @@ async def mark_completed(orderId: str = Path(...), x_admin_secret: str = Header(
     return {"message": f"Order {orderId} marked as completed"}
 
 # -----------------------
-# Test route
+# Test / Health
 # -----------------------
 @app.get("/")
 async def root():
     return {"message": "Kairah Studio API running!"}
 
-# -----------------------
-# Health check
-# -----------------------
 @app.get("/health")
 async def health():
     return {
